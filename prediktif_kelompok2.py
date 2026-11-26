@@ -10,6 +10,7 @@ import paho.mqtt.client as mqtt
 import json
 import RPi.GPIO as GPIO
 import os
+from typing import Optional, Tuple
 
 
 # =====================================
@@ -139,8 +140,155 @@ def kirim_mqtt(topic, data):
 
 
 # =====================================
+# KONFIGURASI DAN DRIVER LCD I2C 16x2
+# =====================================
+
+# Isi None untuk deteksi otomatis (0x27 / 0x3F), atau isi eksplisit misal 0x27
+LCD_I2C_ADDR: Optional[int] = None
+LCD_CANDIDATE_ADDRS: Tuple[int, ...] = (
+    0x27, 0x3F, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 0x20,
+    0x3E, 0x3D, 0x3C, 0x3B, 0x3A, 0x39, 0x38,
+)
+LCD_COLS: int = 16
+LCD_ROWS: int = 2
+
+
+class I2CLcd16x2:
+    """Driver LCD karakter 16x2 berbasis PCF8574 menggunakan busio.I2C."""
+
+    _RS: int = 0x01
+    _EN: int = 0x04
+    _BACKLIGHT: int = 0x08
+    _ROW_OFFSETS: Tuple[int, int] = (0x80, 0xC0)
+
+    def __init__(self, i2c_bus: busio.I2C, address: int) -> None:
+        self._i2c: busio.I2C = i2c_bus
+        self._addr: int = address
+        self._backlight: int = self._BACKLIGHT
+        self._init_display()
+
+    def _acquire_bus(self) -> None:
+        deadline: float = time.monotonic() + 1.0
+        while not self._i2c.try_lock():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Timeout mengambil kunci bus I2C untuk LCD.")
+            time.sleep(0.001)
+
+    def _write_nibble_locked(self, nibble_and_mode: int) -> None:
+        data: int = nibble_and_mode | self._backlight
+        # Set RS and data lines while EN=0 first so tAS setup time is satisfied before EN rises.
+        self._i2c.writeto(self._addr, bytes([data]))
+        self._i2c.writeto(self._addr, bytes([data | self._EN]))
+        time.sleep(0.0002)
+        self._i2c.writeto(self._addr, bytes([data]))
+        time.sleep(0.0001)
+
+    def _write_byte_locked(self, value: int, mode: int = 0) -> None:
+        high_nibble: int = (value & 0xF0) | mode
+        low_nibble: int = ((value << 4) & 0xF0) | mode
+        self._write_nibble_locked(high_nibble)
+        self._write_nibble_locked(low_nibble)
+
+    def _init_display(self) -> None:
+        time.sleep(0.05)
+        self._acquire_bus()
+        try:
+            for delay in (0.005, 0.005, 0.001):
+                self._write_nibble_locked(0x30)
+                time.sleep(delay)
+            self._write_nibble_locked(0x20)
+            time.sleep(0.001)
+
+            for cmd in (0x28, 0x08, 0x01, 0x06, 0x0C):
+                self._write_byte_locked(cmd, mode=0)
+                if cmd == 0x01:
+                    time.sleep(0.003)
+        finally:
+            self._i2c.unlock()
+
+    def clear(self) -> None:
+        """Hapus seluruh karakter pada layar LCD."""
+        self._acquire_bus()
+        try:
+            self._write_byte_locked(0x01, mode=0)
+            time.sleep(0.002)
+        finally:
+            self._i2c.unlock()
+
+    def set_backlight(self, enabled: bool) -> None:
+        """Nyalakan atau matikan lampu latar LCD."""
+        self._backlight = self._BACKLIGHT if enabled else 0x00
+        self._acquire_bus()
+        try:
+            self._i2c.writeto(self._addr, bytes([self._backlight]))
+        finally:
+            self._i2c.unlock()
+
+    def display_lines(self, line1: str, line2: str) -> None:
+        """Tampilkan 2 baris teks (16 karakter per baris) tanpa flicker."""
+        rows: Tuple[str, str] = (
+            line1[:LCD_COLS].ljust(LCD_COLS),
+            line2[:LCD_COLS].ljust(LCD_COLS),
+        )
+        self._acquire_bus()
+        try:
+            for row_idx, text in enumerate(rows):
+                self._write_byte_locked(self._ROW_OFFSETS[row_idx], mode=0)
+                for ch in text:
+                    self._write_byte_locked(ord(ch), mode=self._RS)
+        finally:
+            self._i2c.unlock()
+
+
+def init_lcd(i2c_bus: busio.I2C, preferred_addr: Optional[int] = None) -> Optional[I2CLcd16x2]:
+    """Deteksi alamat LCD I2C dan kembalikan instance I2CLcd16x2 jika tersedia."""
+    while not i2c_bus.try_lock():
+        time.sleep(0.001)
+    try:
+        found: list = i2c_bus.scan()
+    finally:
+        i2c_bus.unlock()
+
+    target_addr: Optional[int] = None
+    if preferred_addr is not None:
+        if preferred_addr in found:
+            target_addr = preferred_addr
+    else:
+        for candidate in LCD_CANDIDATE_ADDRS:
+            if candidate in found:
+                target_addr = candidate
+                break
+
+    if target_addr is None:
+        print(
+            "Peringatan: LCD I2C 16x2 tidak ditemukan di alamat {}. Perangkat I2C terdeteksi: {}".format(
+                [hex(a) for a in LCD_CANDIDATE_ADDRS],
+                [hex(a) for a in found],
+            )
+        )
+        return None
+
+    lcd_device: I2CLcd16x2 = I2CLcd16x2(i2c_bus, target_addr)
+    print("LCD I2C 16x2 berhasil diinisialisasi di alamat", hex(target_addr))
+    return lcd_device
+
+
+def format_lcd_lines(suhu: Optional[float], rms_total: float) -> Tuple[str, str]:
+    """Format nilai suhu dan RMS total agar pas di layar 16x2."""
+    if suhu is not None:
+        line1: str = "Suhu:{:6.2f} C".format(suhu)
+    else:
+        line1 = "Suhu: Error"
+
+    line2: str = "RMS:{:6.3f} m/s2".format(rms_total)
+    return line1, line2
+
+
+# =====================================
 # INISIALISASI KOMUNIKASI I2C
 # =====================================
+
+lcd: Optional[I2CLcd16x2] = None
 
 try:
 
@@ -148,6 +296,8 @@ try:
         board.SCL,
         board.SDA
     )
+
+    lcd = init_lcd(i2c, LCD_I2C_ADDR)
 
     # =====================================
     # INISIALISASI SENSOR ADXL345
@@ -232,6 +382,12 @@ INTERVAL = 0.01
 print("--------------------------------------")
 print("Memulai kalibrasi otomatis...")
 print("Pastikan sensor dalam keadaan diam!")
+
+if lcd is not None:
+    try:
+        lcd.display_lines("Kalibrasi ADXL..", "Jangan gerak...")
+    except Exception as lcd_err:
+        print("Gagal menulis ke LCD:", lcd_err)
 
 total_x = 0.0
 total_y = 0.0
@@ -504,6 +660,13 @@ try:
         print("Alert Status  :", alert_status)
         print("Alert Message :", alert_message)
 
+        if lcd is not None:
+            try:
+                baris1, baris2 = format_lcd_lines(suhu, rms_total)
+                lcd.display_lines(baris1, baris2)
+            except Exception as lcd_err:
+                print("Gagal memperbarui LCD:", lcd_err)
+
         # =====================================
         # PENGIRIMAN ATTRIBUTES THINGSBOARD
         # =====================================
@@ -595,8 +758,15 @@ except Exception as e:
 finally:
 
     # =====================================
-    # PEMBERSIHAN GPIO
+    # PEMBERSIHAN LCD DAN GPIO
     # =====================================
+
+    if lcd is not None:
+        try:
+            lcd.clear()
+            lcd.set_backlight(False)
+        except Exception:
+            pass
 
     GPIO.output(
         BUZZER_PIN,
