@@ -163,9 +163,21 @@ class I2CLcd16x2:
 
     def __init__(self, i2c_bus: busio.I2C, address: int) -> None:
         self._i2c: busio.I2C = i2c_bus
+        self.address: int = address
         self._addr: int = address
         self._backlight: int = self._BACKLIGHT
         self._init_display()
+
+    def is_connected(self) -> bool:
+        """Periksa apakah modul PCF8574 masih merespons ACK pada bus I2C."""
+        self._acquire_bus()
+        try:
+            self._i2c.writeto(self._addr, bytes([self._backlight]))
+            return True
+        except OSError:
+            return False
+        finally:
+            self._i2c.unlock()
 
     def _acquire_bus(self) -> None:
         deadline: float = time.monotonic() + 1.0
@@ -241,13 +253,15 @@ class I2CLcd16x2:
 
 
 def init_lcd(i2c_bus: busio.I2C, preferred_addr: Optional[int] = None) -> Optional[I2CLcd16x2]:
-    """Deteksi alamat LCD I2C dan kembalikan instance I2CLcd16x2 jika tersedia."""
+    """Deteksi alamat LCD I2C, cek koneksi, dan kembalikan instance I2CLcd16x2 jika tersedia."""
     while not i2c_bus.try_lock():
         time.sleep(0.001)
     try:
         found: list = i2c_bus.scan()
     finally:
         i2c_bus.unlock()
+
+    print("[I2C] Perangkat terdeteksi:", [hex(a) for a in found])
 
     target_addr: Optional[int] = None
     if preferred_addr is not None:
@@ -261,16 +275,25 @@ def init_lcd(i2c_bus: busio.I2C, preferred_addr: Optional[int] = None) -> Option
 
     if target_addr is None:
         print(
-            "Peringatan: LCD I2C 16x2 tidak ditemukan di alamat {}. Perangkat I2C terdeteksi: {}".format(
-                [hex(a) for a in LCD_CANDIDATE_ADDRS],
-                [hex(a) for a in found],
+            "Status LCD I2C : TIDAK TERHUBUNG (alamat {} tidak ditemukan di bus I2C)".format(
+                [hex(a) for a in LCD_CANDIDATE_ADDRS[:2]]
             )
         )
         return None
 
-    lcd_device: I2CLcd16x2 = I2CLcd16x2(i2c_bus, target_addr)
-    print("LCD I2C 16x2 berhasil diinisialisasi di alamat", hex(target_addr))
-    return lcd_device
+    try:
+        lcd_device: I2CLcd16x2 = I2CLcd16x2(i2c_bus, target_addr)
+        terhubung: bool = lcd_device.is_connected()
+        print(
+            "Status LCD I2C : {} (alamat {})".format(
+                "TERHUBUNG" if terhubung else "TIDAK MERESPONS",
+                hex(target_addr),
+            )
+        )
+        return lcd_device if terhubung else None
+    except Exception as exc:
+        print("Status LCD I2C : GAGAL INISIALISASI ({}) - {}".format(hex(target_addr), exc))
+        return None
 
 
 def format_lcd_lines(suhu: Optional[float], rms_total: float) -> Tuple[str, str]:
@@ -660,12 +683,19 @@ try:
         print("Alert Status  :", alert_status)
         print("Alert Message :", alert_message)
 
+        print("\n--- LCD I2C 16x2 ---")
+
         if lcd is not None:
             try:
                 baris1, baris2 = format_lcd_lines(suhu, rms_total)
                 lcd.display_lines(baris1, baris2)
+                print("Status LCD : TERHUBUNG ({})".format(hex(lcd.address)))
+                print("Baris 1    :", baris1)
+                print("Baris 2    :", baris2)
             except Exception as lcd_err:
-                print("Gagal memperbarui LCD:", lcd_err)
+                print("Status LCD : TERPUTUS / GAGAL ({}) - {}".format(hex(lcd.address), lcd_err))
+        else:
+            print("Status LCD : TIDAK TERHUBUNG (tidak terdeteksi saat inisialisasi)")
 
         # =====================================
         # PENGIRIMAN ATTRIBUTES THINGSBOARD
